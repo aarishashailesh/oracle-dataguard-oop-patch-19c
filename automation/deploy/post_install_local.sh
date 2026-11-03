@@ -11,12 +11,13 @@
 #   D. Run XOQ_VALIDATE, APS_VALIDATE, utlrp (primary only)
 #   E. Verify v$option, DBA_REGISTRY, datapatch status
 #   F. Verify Grid patch level and CRS resource status
+#   G. Enable SYS.DB_DDL_ALERT_TRG again, primary only (disabled by deploy_s_peer.sh)
 #
 # Usage:
 #   On lnx107 (primary, post-switchback):  bash deploy/post_install_local.sh
 #   On lnx113 (standby):                  bash deploy/post_install_local.sh
 #
-# Background-safe: systemd-run --unit=dgpatch-post-install-local --remain-after-exit --working-directory=<automation dir> bash deploy/post_install_local.sh
+# Background-safe: systemd-run --unit=dgpatch-post-install-local --remain-after-exit bash deploy/post_install_local.sh
 # =============================================================================
 set -euo pipefail
 umask 0022
@@ -59,6 +60,10 @@ print_dry_run_plan() {
   drstep "Step F: Grid CRS verification"
   drcmd  "${NEW_GRID_HOME}/bin/crsctl query crs releasepatch"
   drcmd  "${NEW_GRID_HOME}/bin/crsctl stat res -t"
+  drstep "Step G: Enable SYS.DB_DDL_ALERT_TRG (primary only)"
+  drcmd  "sqlplus / as sysdba: ALTER TRIGGER SYS.DB_DDL_ALERT_TRG ENABLE  (non-CDB, or CDB root and every READ WRITE PDB; ORACLE_SID=${PRIMARY_SID}, ORACLE_HOME=${NEW_DB_HOME})"
+  drnote "Run only when this node is the PRIMARY (after switchback). Standby: nothing to do, it replicates via redo."
+  echo ""
   echo "  Run WITHOUT --dry-run to execute."
   echo ""
   set -u
@@ -238,6 +243,24 @@ log "  CRS resource status:"
 "${NEW_GRID_HOME}/bin/crsctl" status resource -t 2>/dev/null \
   | while read -r l; do log "  ${l}"; done || true
 pass "Grid CRS verification complete"
+
+# ── Step G: Enable SYS.DB_DDL_ALERT_TRG again (disabled by deploy_s_peer.sh) ──
+step "Step G: Enable SYS.DB_DDL_ALERT_TRG (primary only)"
+if ${IS_PRIMARY}; then
+  MY_ROLE=$(runsql "${NEW_DB_HOME}" "${MY_SID}" \
+    "SELECT DATABASE_ROLE FROM V\$DATABASE;" \
+    2>/dev/null | grep -v "^$\|DATABASE_ROLE\|---" | sed 's/^[[:space:]]*//' | head -1 || echo "ERR")
+  if [[ "${MY_ROLE}" == "PRIMARY" ]]; then
+    ddl_trigger ENABLE "${NEW_DB_HOME}" "${MY_SID}" \
+      && pass "SYS.DB_DDL_ALERT_TRG enabled (replicates to the standby via redo)" \
+      || fail "Could not enable SYS.DB_DDL_ALERT_TRG -- run: alter trigger SYS.DB_DDL_ALERT_TRG enable;  in the root and each PDB"
+  else
+    warn "${THIS_HOST} is ${MY_ROLE}, not PRIMARY -- SYS.DB_DDL_ALERT_TRG NOT enabled. Complete the switchback, then re-run this script."
+  fi
+else
+  log "  Standby: nothing to do (the trigger state replicates from the primary via redo)"
+  pass "Step G skipped on standby"
+fi
 
 print_summary "post_install_local"
 log ""

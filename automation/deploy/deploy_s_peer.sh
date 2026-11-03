@@ -7,6 +7,7 @@
 #   - DG lag = 0 and no archive gap
 #   - DG Broker shows SUCCESS
 #   - Primary is healthy
+#   - Then disables SYS.DB_DDL_ALERT_TRG on the primary (db/cdb/pdb) when all checks pass
 # =============================================================================
 set -euo pipefail
 
@@ -39,6 +40,9 @@ print_dry_run_plan() {
   drcmd  "df -BG ${NEW_GRID_HOME%/*} | tail -1"
   drcmd  "test -d ${NEW_GRID_HOME}"
   drcmd  "test -d ${NEW_DB_HOME}"
+  drstep "Step 7: Disable SYS.DB_DDL_ALERT_TRG on the primary (only if checks 1-6 passed)"
+  drcmd  "sqlplus / as sysdba: ALTER TRIGGER SYS.DB_DDL_ALERT_TRG DISABLE  (non-CDB, or CDB root and every READ WRITE PDB; ORACLE_SID=${PRIMARY_SID}, ORACLE_HOME=${OLD_DB_HOME})"
+  drnote "Replicates to ${STANDBY_HOST} through redo. post_install_local.sh enables it again after patching."
   echo "  Run WITHOUT --dry-run to execute."
   echo ""
   set -u
@@ -116,6 +120,15 @@ log "  /u01 available: ${AVAIL} GB"
   || fail "New Grid home missing — run prep_p_local.sh first"
 [[ -d "${NEW_DB_HOME}" ]] && pass "New DB home ready: ${NEW_DB_HOME}" \
   || fail "New DB home missing — run prep_p_local.sh first"
+
+step "Step 7: Disable SYS.DB_DDL_ALERT_TRG before the switchover and datapatch"
+if (( FAILED == 0 )); then
+  ddl_trigger DISABLE "${OLD_DB_HOME}" "${PRIMARY_SID}" \
+    && pass "SYS.DB_DDL_ALERT_TRG disabled (replicates to ${STANDBY_HOST} via redo)" \
+    || fail "Could not disable SYS.DB_DDL_ALERT_TRG -- fix before the switchover"
+else
+  warn "Checks above failed -- SYS.DB_DDL_ALERT_TRG NOT disabled. Fix and re-run this script."
+fi
 
 print_summary "deploy_s_peer"
 log ""

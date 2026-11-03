@@ -5,7 +5,7 @@
 # Outage: NONE — standby continues applying redo throughout
 #
 # BACKGROUND-SAFE: runs entirely on lnx113, no peer interaction.
-# systemd-run --unit=dgpatch-prep-s-local --remain-after-exit --working-directory=<automation dir> bash prep/prep_s_local.sh
+# systemd-run --unit=dgpatch-prep-s-local --remain-after-exit bash prep/prep_s_local.sh
 # tail -f /u01/app/oracle/patch_logs/lnx113/prep_s_local.log
 #
 # What this script does:

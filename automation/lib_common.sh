@@ -97,6 +97,72 @@ rundgmgrl_auth() {
 }
 
 # ---------------------------------------------------------------------------
+# ddl_trigger DISABLE|ENABLE <oracle_home> <oracle_sid>
+# SYS.DB_DDL_ALERT_TRG: disabled on the primary before the switchover and
+# datapatch, enabled again by post_install_local.sh after patching.
+# Works for a non-CDB, or a CDB (root plus every READ WRITE PDB). Containers
+# without the trigger are skipped. Run on the PRIMARY only (DDL replicates to
+# the standby through redo). Returns non-zero if sqlplus fails.
+# ---------------------------------------------------------------------------
+ddl_trigger() {
+  local action="$1" home="$2" sid="$3" rc=0
+  local sqlf out
+  sqlf=$(mktemp /tmp/ddl_trg_XXXXXX.sql)
+  out=$(mktemp /tmp/ddl_trg_XXXXXX.out)
+  cat > "${sqlf}" << 'SQLEOF'
+SET SERVEROUTPUT ON SIZE UNLIMITED FEEDBACK OFF PAGESIZE 0 LINESIZE 200
+WHENEVER SQLERROR EXIT FAILURE
+DECLARE
+  TYPE t_names IS TABLE OF VARCHAR2(128);
+  v_names   t_names := t_names();
+  v_skipped t_names := t_names();
+  v_cdb     VARCHAR2(3);
+  PROCEDURE do_trg(p_label IN VARCHAR2) IS
+    v_cnt PLS_INTEGER;
+  BEGIN
+    EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM dba_triggers WHERE owner = ''SYS'' AND trigger_name = ''DB_DDL_ALERT_TRG''' INTO v_cnt;
+    IF v_cnt = 0 THEN
+      DBMS_OUTPUT.PUT_LINE('DB_DDL_ALERT_TRG ' || p_label || ': trigger not present, skipped');
+    ELSE
+      EXECUTE IMMEDIATE 'ALTER TRIGGER SYS.DB_DDL_ALERT_TRG __ACTION__';
+      DBMS_OUTPUT.PUT_LINE('DB_DDL_ALERT_TRG ' || p_label || ': __ACTION__ done');
+    END IF;
+  END do_trg;
+BEGIN
+  EXECUTE IMMEDIATE 'SELECT cdb FROM v$database' INTO v_cdb;
+  do_trg(CASE WHEN v_cdb = 'YES' THEN 'CDB$ROOT' ELSE 'non-CDB' END);
+  IF v_cdb = 'YES' THEN
+    EXECUTE IMMEDIATE q'[SELECT name FROM v$pdbs WHERE name <> 'PDB$SEED' AND open_mode = 'READ WRITE' ORDER BY con_id]'
+      BULK COLLECT INTO v_names;
+    EXECUTE IMMEDIATE q'[SELECT name FROM v$pdbs WHERE name <> 'PDB$SEED' AND open_mode <> 'READ WRITE' ORDER BY con_id]'
+      BULK COLLECT INTO v_skipped;
+    FOR i IN 1 .. v_names.COUNT LOOP
+      EXECUTE IMMEDIATE 'ALTER SESSION SET CONTAINER = ' || DBMS_ASSERT.ENQUOTE_NAME(v_names(i), FALSE);
+      do_trg(v_names(i));
+    END LOOP;
+    EXECUTE IMMEDIATE 'ALTER SESSION SET CONTAINER = CDB$ROOT';
+    FOR i IN 1 .. v_skipped.COUNT LOOP
+      DBMS_OUTPUT.PUT_LINE('DB_DDL_ALERT_TRG WARNING: PDB ' || v_skipped(i) || ' is not READ WRITE, skipped');
+    END LOOP;
+  END IF;
+END;
+/
+EXIT
+SQLEOF
+  sed -i "s/__ACTION__/${action}/g" "${sqlf}"
+  chmod 644 "${sqlf}"
+  runora "
+    export ORACLE_HOME=${home}
+    export ORACLE_SID=${sid}
+    export PATH=\${ORACLE_HOME}/bin:\${PATH}
+    \${ORACLE_HOME}/bin/sqlplus -s / as sysdba @${sqlf}
+  " > "${out}" 2>&1 || rc=$?
+  while IFS= read -r l; do log "  ${l}"; done < "${out}"
+  rm -f "${sqlf}" "${out}"
+  return "${rc}"
+}
+
+# ---------------------------------------------------------------------------
 # check_installer_rc <label> <rc> <GridSetupActions|InstallActions>
 # gridSetup.sh and runInstaller exit codes: 0 = success, 6 = success with
 # optional prerequisite warnings (e.g. [INS-13014]), anything else = failure.

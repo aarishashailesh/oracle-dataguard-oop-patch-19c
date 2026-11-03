@@ -226,7 +226,7 @@ df -BG /u01
 Every step below is started with `dgrun` (defined in the next section) so that it survives hardened
 session settings (`KillUserProcesses=yes`, 600 s idle logout, `TMOUT=600`). Run each step on the host
 shown, as root, from the automation directory. Wait for `Result=success` (see "Watching a step")
-before starting the next step. Scripts that prompt for the SYS password use `dgrun -t` (interactive).
+before starting the next step. Scripts that prompt (SYS password, or YES in the cleanup) use `dgrun -t` (interactive).
 
 ### Running steps with systemd-run (hardened hosts)
 
@@ -241,12 +241,20 @@ Define this once per login on each node (root):
 cd /u01/patching/automation          # directory that holds patch.conf, lib_common.sh, prep/, deploy/ ...
 dgrun() {
   # usage: dgrun [-t] <script path relative to this dir> [script args, e.g. --dry-run or --from-step 6]
-  local pty=""; [[ "$1" == "-t" ]] && { pty="--pty"; shift; }
+  local tty=0; [[ "$1" == "-t" ]] && { tty=1; shift; }
   local script="$1"; shift
   local unit="dgpatch-$(basename "${script}" .sh | tr _ -)"
-  systemctl stop "${unit}" 2>/dev/null || true                 # clear a finished unit of the same name
-  systemd-run ${pty} --unit="${unit}" --remain-after-exit \
-    --working-directory="$(pwd)" bash "$(pwd)/${script}" "$@"
+  systemctl stop "${unit}" 2>/dev/null || true               # clear a finished unit of the same name
+  systemctl reset-failed "${unit}" 2>/dev/null || true
+  if (( tty )); then                                          # interactive (password prompt)
+    if systemd-run --help 2>&1 | grep -q -- '--pty'; then    # systemd 235 or newer
+      systemd-run --pty --unit="${unit}" --remain-after-exit bash "$(pwd)/${script}" "$@"
+    else                                                      # older systemd (e.g. OL7): foreground scope
+      systemd-run --scope --unit="${unit}" bash "$(pwd)/${script}" "$@"
+    fi
+  else                                                        # background service
+    systemd-run --unit="${unit}" --remain-after-exit bash "$(pwd)/${script}" "$@"
+  fi
 }
 dgstat() {    # usage: dgstat <script name without path, e.g. prep_s_local>
   local unit="dgpatch-$(echo "$1" | tr _ -)"
@@ -254,10 +262,13 @@ dgstat() {    # usage: dgstat <script name without path, e.g. prep_s_local>
 }
 ```
 - Plain `dgrun` runs in the background and returns at once. Use it for every step that does not ask a question.
-- `dgrun -t` uses `systemd-run --pty`: the script still runs outside your session scope, but it is attached to
-  your terminal so you can type the SYS password. Use it only for `switchtest_local.sh`, `switchover_local.sh`
-  and `switchback_local.sh`. If your terminal drops, a `--pty` job is hung up, so keep it attended and
+- `dgrun -t` uses `systemd-run --pty` (or `systemd-run --scope` on systemd older than 235): the script still
+  runs outside your session scope, but it is attached to your terminal so you can type the SYS password. Use it only for `switchtest_local.sh`, `switchover_local.sh`,
+  `switchback_local.sh` (SYS password) and `cleanup_local.sh` (asks you to type YES). If your terminal drops, a `--pty` job is hung up, so keep it attended and
   short (a few minutes each).
+- Old systemd (for example OL7, v219) has no `--working-directory` and no `--pty`. `dgrun` does not use
+  `--working-directory` (the scripts find their own directory), and it falls back to `--scope` for `-t`.
+  Check with `systemctl --version | head -1`.
 - Do not pass the SYS password with `--setenv` or `-p Environment=`. Anyone can read unit environments with
   `systemctl show`, and the scripts promise never to expose the password.
 
@@ -298,7 +309,8 @@ dgrun switch_test/switchtest_peer.sh         # ON STANDBY_HOST
 ```bash
 # 1. Patch the standby home (no production impact):
 dgrun deploy/deploy_s_local.sh               # ON STANDBY_HOST   unit dgpatch-deploy-s-local
-# 2. Verify standby patched and primary healthy:
+# 2. Verify standby patched and primary healthy. When all checks pass it also DISABLES
+#    SYS.DB_DDL_ALERT_TRG on the primary (db/cdb/pdb); it replicates to the standby via redo:
 dgrun deploy/deploy_s_peer.sh                # ON PRIMARY_HOST
 # 3. SWITCHOVER (production downtime starts):
 dgrun -t deploy/switchover_local.sh          # ON PRIMARY_HOST   (prompts for the SYS password)
@@ -324,9 +336,10 @@ dgrun deploy/validate_peer.sh                # ON STANDBY_HOST
 
 ### Phase 5 - Post-patch hardening (both nodes, no downtime)
 ```bash
-dgrun deploy/post_install_local.sh           # ON PRIMARY_HOST, then ON STANDBY_HOST   (chopt, utlrp, registry)
+dgrun deploy/post_install_local.sh           # ON PRIMARY_HOST, then ON STANDBY_HOST   (chopt, utlrp, registry; primary also
+                                             #   ENABLES SYS.DB_DDL_ALERT_TRG again in Step G)
 dgrun deploy/security_local.sh               # ON PRIMARY_HOST, then ON STANDBY_HOST   (FIPS, extproc)
-dgrun deploy/cleanup_local.sh                # ON PRIMARY_HOST, then ON STANDBY_HOST   (deinstall old homes, opt-in)
+dgrun -t deploy/cleanup_local.sh             # ON PRIMARY_HOST, then ON STANDBY_HOST   (asks YES; detach + remove old homes, opt-in)
 dgrun deploy/aide_local.sh                   # ON PRIMARY_HOST, then ON STANDBY_HOST   (about 60 min)
 ```
 
@@ -428,6 +441,9 @@ fix this automatically in Step 3d.
 ---
 
 ## v3 Changes
+
+0. **SYS.DB_DDL_ALERT_TRG.** `deploy_s_peer.sh` (on the primary, before the switchover, only when all its checks pass) disables the trigger in the non-CDB, or in the CDB root and every READ WRITE PDB. The DDL replicates to the standby through redo. `post_install_local.sh` Step G enables it again on the primary after patching (it refuses if the node is not PRIMARY). Containers without the trigger are skipped, PDBs that are not READ WRITE are reported. The helper is `ddl_trigger` in `lib_common.sh`.
+0b. **`cleanup_local.sh`:** `deinstall` is gone. Each old home is detached with `runInstaller -silent -detachHome ORACLE_HOME=<old home>` (from the new home, as the owner of the old home), and only if both detaches succeed are the old directories removed. The previous version looked up home names with a broken quote, so inventory entries were never detached. The script asks for YES, so start it with `dgrun -t`.
 
 1. `prep_s_local.sh`, `prep_p_local.sh`: `gridSetup.sh` and `runInstaller` exit code 6 (success with optional prerequisite warnings) is accepted via the new `check_installer_rc` helper in `lib_common.sh`. Previously `&& pass || fail` treated 6 as a failure and stopped the prep.
 2. `lib_common.sh`: `run_gi_switch` logs the `gridSetup.sh -switchGridHome` exit code (0 and 6 are success).

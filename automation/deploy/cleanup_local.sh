@@ -3,13 +3,11 @@
 # deploy/cleanup_local.sh — Deinstall Old Homes (run on EACH node separately)
 # Run as: root  ON: lnx107 AND lnx113 (independently, after validation)
 #
-# Changes from v1:
-#   - Deinstall uses -checkonly to generate paramfile, then -silent -paramfile
-#     for a clean deinstall with proper oraInventory cleanup. Falls back to
-#     rm -rf if deinstall fails (same net result, stale inventory entries removed
-#     via detachHome).
-#   - Added runInstaller -silent -detachHome to remove stale inventory entries
-#     for both old homes after directory removal.
+# Method (v3): each old home is detached from the Oracle inventory with
+#   <new home>/oui/bin/runInstaller -silent -detachHome ORACLE_HOME=<old home>
+# run as the owner of that home, and only then are the old directories removed.
+# deinstall is not used. If a detach fails, nothing is deleted.
+# Interactive: asks you to type YES (start it with: dgrun -t deploy/cleanup_local.sh).
 #
 # WARNING: IRREVERSIBLE. Only run after validate_local.sh + validate_peer.sh
 # have both passed AND post_install_local.sh is confirmed on both nodes.
@@ -32,26 +30,16 @@ print_dry_run_plan() {
   drcmd  "test -d ${NEW_GRID_HOME}"
   drcmd  "test -d ${NEW_DB_HOME}"
   echo ""
-  drstep "Reset permissions on old homes"
-  drcmd  "chmod -R 775 ${OLD_GRID_HOME}/"
-  drcmd  "chmod -R 775 ${OLD_DB_HOME}/"
-  echo ""
-  drstep "Deinstall old Grid home: ${OLD_GRID_HOME}"
-  drcmd  "su - ${GRID_USER} -c \"${OLD_GRID_HOME}/deinstall/deinstall -silent -checkonly -o <paramfile>\""
-  drcmd  "su - ${GRID_USER} -c \"${OLD_GRID_HOME}/deinstall/deinstall -silent -paramfile <paramfile>\""
-  echo ""
-  drstep "Deinstall old DB home: ${OLD_DB_HOME}"
-  drcmd  "su - ${ORACLE_USER} -c \"${OLD_DB_HOME}/deinstall/deinstall -silent -checkonly -o <paramfile>\""
-  drcmd  "su - ${ORACLE_USER} -c \"${OLD_DB_HOME}/deinstall/deinstall -silent -paramfile <paramfile>\""
+  drstep "Detach old homes from the Oracle inventory (nothing is deleted if a detach fails)"
+  drcmd  "su - ${ORACLE_USER} -c \"${NEW_DB_HOME}/oui/bin/runInstaller -silent -detachHome ORACLE_HOME=${OLD_DB_HOME}\""
+  drcmd  "su - ${GRID_USER} -c \"${NEW_GRID_HOME}/oui/bin/runInstaller -silent -detachHome ORACLE_HOME=${OLD_GRID_HOME}\""
+  drnote "Homes already detached (or marked REMOVED in inventory.xml) are skipped"
   echo ""
   drstep "Remove residual directories"
-  drcmd  "rm -rf ${OLD_GRID_HOME%/*}  # removes /u01/app/${OLD_PATCH_LEVEL}"
-  drcmd  "rm -rf ${OLD_DB_HOME}       # removes ${OLD_DB_HOME}"
+  drcmd  "rm -rf ${OLD_GRID_HOME%/*}  # parent of the old Grid home"
+  drcmd  "rm -rf ${OLD_DB_HOME}"
   echo ""
-  drstep "Clean oraInventory entries"
-  drcmd  "${NEW_DB_HOME}/oui/bin/runInstaller -silent -detachHome -homeName <OLD_GRID_HOME_NAME> -invPtrLoc /etc/oraInst.loc"
-  drcmd  "${NEW_DB_HOME}/oui/bin/runInstaller -silent -detachHome -homeName <OLD_DB_HOME_NAME>   -invPtrLoc /etc/oraInst.loc"
-  drnote "Home names detected dynamically from inventory.xml at runtime"
+  drstep "Final verification (new homes present, old homes gone, inventory listing)"
   echo "  Run WITHOUT --dry-run to execute."
   echo ""
   set -u
@@ -74,7 +62,7 @@ log "  OK validate_peer.sh passed on ${STANDBY_HOST}"
 log "  OK post_install_local.sh passed on this node"
 
 echo ""
-read -r -p "  Type YES to proceed with deinstall on ${THIS_HOST}: " _confirm
+read -r -p "  Type YES to proceed with the cleanup (detach and remove old homes) on ${THIS_HOST}: " _confirm
 if [[ "${_confirm}" != "YES" ]]; then
   log "Cleanup aborted by operator."
   exit 0
@@ -90,116 +78,70 @@ pass "New Grid home active at ${NEW_PATCH_LEVEL}"
 [[ -d "${NEW_DB_HOME}" ]] && pass "New DB home exists: ${NEW_DB_HOME}" \
   || { fail "New DB home missing: ${NEW_DB_HOME}"; exit 1; }
 
-step "Reset permissions on old homes"
-if [[ -d "${OLD_GRID_HOME}" ]]; then
-  chmod -R 775 "${OLD_GRID_HOME}/" 2>/dev/null || true
-  chown -R "${GRID_USER}:${INSTALL_GROUP}" "${OLD_GRID_HOME}/" 2>/dev/null || true
-  pass "Old Grid home permissions reset"
+# ---------------------------------------------------------------------------
+# Inventory helpers
+INV_LOC="${ORA_INV_LOC:-}"
+if [[ -z "${INV_LOC}" ]]; then
+  INV_LOC=$(awk -F= '/^inventory_loc/{print $2}' /etc/oraInst.loc 2>/dev/null | tr -d ' ' || true)
 fi
-if [[ -d "${OLD_DB_HOME}" ]]; then
-  chmod -R 775 "${OLD_DB_HOME}/" 2>/dev/null || true
-  chown -R "${ORACLE_USER}:${INSTALL_GROUP}" "${OLD_DB_HOME}/" 2>/dev/null || true
-  pass "Old DB home permissions reset"
-fi
+INV_LOC="${INV_LOC:-/u01/app/oraInventory}"
+INV_XML="${INV_LOC}/ContentsXML/inventory.xml"
+
+# True if the home path is registered in the inventory and not marked REMOVED.
+home_in_inventory() {
+  grep -F "LOC=\"${1%/}\"" "${INV_XML}" 2>/dev/null | grep -qv 'REMOVED="T"'
+}
+
+# detach_home <os_user> <runInstaller path> <old home>
+# Runs as the home owner with a clean environment.
+detach_home() {
+  local user="$1" oui="$2" old="${3%/}"
+  if ! home_in_inventory "${old}"; then
+    log "  ${old} is not registered in the inventory (already detached) -- skipped"
+    return 0
+  fi
+  [[ -x "${oui}" ]] || { log "  ${oui} not found or not executable"; return 1; }
+  log "  ${oui} -silent -detachHome ORACLE_HOME=${old}  (as ${user})"
+  su - "${user}" -c "unset ORACLE_HOME ORACLE_SID LD_LIBRARY_PATH; export CV_ASSUME_DISTID=${CV_ASSUME_DISTID:-OEL7.8}; ${oui} -silent -detachHome ORACLE_HOME=${old}" \
+    || { log "  detachHome returned non-zero for ${old}"; return 1; }
+  if home_in_inventory "${old}"; then
+    log "  ${old} is still registered in ${INV_XML} after detachHome"
+    return 1
+  fi
+  log "  Detached from inventory: ${old}"
+}
+
+# safe_rm <directory>: refuses anything too broad or containing a new home.
+safe_rm() {
+  local d="${1%/}"
+  case "${d}" in ""|"/"|"/u01"|"/u01/app") log "  refusing to remove '${d}'"; return 1 ;; esac
+  case "${NEW_GRID_HOME%/}/" in "${d}/"*) log "  ${d} contains the new Grid home -- not removing"; return 1 ;; esac
+  case "${NEW_DB_HOME%/}/"   in "${d}/"*) log "  ${d} contains the new DB home -- not removing";   return 1 ;; esac
+  if [[ -d "${d}" ]]; then
+    local sz; sz=$(du -sh "${d}" 2>/dev/null | awk '{print $1}' || echo "?")
+    log "  Removing ${d} (${sz})..."
+    rm -rf "${d}"
+  fi
+}
 
 # ---------------------------------------------------------------------------
-step "Deinstall old Grid home: ${OLD_GRID_HOME}"
-if [[ -d "${OLD_GRID_HOME}" ]]; then
-  GRID_DEINSTALL_RSP=$(mktemp /tmp/grid_deinstall_XXXXXX.rsp)
-  # Generate paramfile silently
-  su - "${GRID_USER}" -c "
-    export CV_ASSUME_DISTID=OEL7.8
-    export ORACLE_HOME=${OLD_GRID_HOME}
-    ${OLD_GRID_HOME}/deinstall/deinstall -silent -checkonly \
-      -paramfile /dev/null -o ${GRID_DEINSTALL_RSP} 2>/dev/null
-  " 2>/dev/null || true
+step "Detach old DB home from the inventory: ${OLD_DB_HOME}"
+detach_home "${ORACLE_USER}" "${NEW_DB_HOME}/oui/bin/runInstaller" "${OLD_DB_HOME}" \
+  && pass "Old DB home detached (or already detached)" \
+  || { fail "Could not detach ${OLD_DB_HOME} -- nothing was deleted. Fix and re-run."; exit 1; }
 
-  if [[ -s "${GRID_DEINSTALL_RSP}" ]]; then
-    su - "${GRID_USER}" -c "
-      export CV_ASSUME_DISTID=OEL7.8
-      export ORACLE_HOME=${OLD_GRID_HOME}
-      echo 'y' | ${OLD_GRID_HOME}/deinstall/deinstall \
-        -silent -paramfile ${GRID_DEINSTALL_RSP} 2>&1
-    " && pass "Old Grid home deinstalled cleanly" \
-      || warn "Grid deinstall returned non-zero"
-  else
-    log "  Could not generate deinstall paramfile -- proceeding with directory removal"
-  fi
-  rm -f "${GRID_DEINSTALL_RSP}"
-fi
-
-# ---------------------------------------------------------------------------
-step "Deinstall old DB home: ${OLD_DB_HOME}"
-if [[ -d "${OLD_DB_HOME}" ]]; then
-  DB_DEINSTALL_RSP=$(mktemp /tmp/db_deinstall_XXXXXX.rsp)
-  su - "${ORACLE_USER}" -c "
-    export CV_ASSUME_DISTID=OEL7.8
-    export ORACLE_HOME=${OLD_DB_HOME}
-    ${OLD_DB_HOME}/deinstall/deinstall -silent -checkonly \
-      -paramfile /dev/null -o ${DB_DEINSTALL_RSP} 2>/dev/null
-  " 2>/dev/null || true
-
-  if [[ -s "${DB_DEINSTALL_RSP}" ]]; then
-    su - "${ORACLE_USER}" -c "
-      export CV_ASSUME_DISTID=OEL7.8
-      export ORACLE_HOME=${OLD_DB_HOME}
-      echo 'y' | ${OLD_DB_HOME}/deinstall/deinstall \
-        -silent -paramfile ${DB_DEINSTALL_RSP} 2>&1
-    " && pass "Old DB home deinstalled cleanly" \
-      || warn "DB deinstall returned non-zero"
-  else
-    log "  Could not generate deinstall paramfile -- proceeding with directory removal"
-  fi
-  rm -f "${DB_DEINSTALL_RSP}"
-fi
+step "Detach old Grid home from the inventory: ${OLD_GRID_HOME}"
+detach_home "${GRID_USER}" "${NEW_GRID_HOME}/oui/bin/runInstaller" "${OLD_GRID_HOME}" \
+  && pass "Old Grid home detached (or already detached)" \
+  || { fail "Could not detach ${OLD_GRID_HOME} -- nothing was deleted. Fix and re-run."; exit 1; }
 
 # ---------------------------------------------------------------------------
 step "Remove residual directories"
-OLD_GRID_PARENT=$(dirname "${OLD_GRID_HOME}")
-if [[ -d "${OLD_GRID_PARENT}" && "${OLD_GRID_PARENT}" != "/" ]]; then
-  SIZE=$(du -sh "${OLD_GRID_PARENT}" 2>/dev/null | awk '{print $1}' || echo "?")
-  log "  Removing ${OLD_GRID_PARENT} (${SIZE})..."
-  rm -rf "${OLD_GRID_PARENT}"
-  pass "Old Grid version directory removed"
-fi
-if [[ -d "${OLD_DB_HOME}" ]]; then
-  SIZE=$(du -sh "${OLD_DB_HOME}" 2>/dev/null | awk '{print $1}' || echo "?")
-  log "  Removing ${OLD_DB_HOME} (${SIZE})..."
-  rm -rf "${OLD_DB_HOME}"
-  pass "Old DB home directory removed"
-fi
+safe_rm "$(dirname "${OLD_GRID_HOME}")" && pass "Old Grid version directory removed" \
+  || { fail "Old Grid directory not removed"; exit 1; }
+safe_rm "${OLD_DB_HOME}" && pass "Old DB home directory removed" \
+  || { fail "Old DB home directory not removed"; exit 1; }
 
-# ---------------------------------------------------------------------------
-step "Clean oraInventory entries for removed homes"
-# Detect actual home names from inventory before detachHome.
-# Home names vary by environment -- do not hardcode them.
-INV_PTR="/etc/oraInst.loc"
-INV_LOC="${ORA_INV_LOC}"
-if [[ -z "${INV_LOC}" ]]; then
-  INV_LOC=$(grep "inventory_loc" /etc/oraInst.loc 2>/dev/null | cut -d= -f2 | tr -d ' ' || echo "")
-fi
-ORA_INV_XML="${INV_LOC}/ContentsXML/inventory.xml"
-OUI="${NEW_DB_HOME}/oui/bin/runInstaller"
-
-if [[ -x "${OUI}" && -f "${ORA_INV_XML}" ]]; then
-  # Detect old Grid home name from inventory XML
-  OLD_GRID_NAME=$(grep "LOC="${OLD_GRID_HOME}"" "${ORA_INV_XML}" 2>/dev/null     | grep -o 'NAME="[^"]*"' | head -1 | sed 's/NAME=//;s/"//g' || echo "")
-  # Detect old DB home name from inventory XML
-  OLD_DB_NAME=$(grep "LOC="${OLD_DB_HOME}"" "${ORA_INV_XML}" 2>/dev/null     | grep -o 'NAME="[^"]*"' | head -1 | sed 's/NAME=//;s/"//g' || echo "")
-
-  for HOME_NAME in "${OLD_GRID_NAME}" "${OLD_DB_NAME}"; do
-    [[ -z "${HOME_NAME}" ]] && continue
-    "${OUI}" -silent -detachHome -homeName "${HOME_NAME}" \
-      -invPtrLoc "${INV_PTR}" 2>/dev/null \
-      && log "  Detached inventory entry: ${HOME_NAME}" \
-      || log "  ${HOME_NAME}: detach returned non-zero (may already be removed)"
-  done
-  pass "oraInventory cleanup attempted"
-else
-  warn "runInstaller or inventory.xml not found -- inventory may have stale entries"
-fi
-
-# ---------------------------------------------------------------------------
 step "Final verification"
 [[ ! -d "${OLD_GRID_HOME}" ]] && pass "Old Grid home removed OK" \
   || fail "Old Grid home still present: ${OLD_GRID_HOME}"
@@ -210,10 +152,15 @@ step "Final verification"
 [[ -d "${NEW_DB_HOME}" ]] && pass "New DB home present OK" \
   || fail "New DB home missing: ${NEW_DB_HOME}"
 
+home_in_inventory "${OLD_GRID_HOME}" && fail "Old Grid home still registered in the inventory" \
+  || pass "Old Grid home not registered in the inventory"
+home_in_inventory "${OLD_DB_HOME}" && fail "Old DB home still registered in the inventory" \
+  || pass "Old DB home not registered in the inventory"
+
 log ""
-log "oraInventory after cleanup:"
-grep -o 'LOC="[^"]*"' /u01/app/oraInventory/ContentsXML/inventory.xml 2>/dev/null \
-  | while read -r l; do log "  ${l}"; done || true
+log "Active homes in the inventory (REMOVED homes hidden):"
+{ grep -i "HOME NAME" "${INV_XML}" 2>/dev/null | grep -v 'REMOVED="T"' || true; } \
+  | while read -r l; do log "  ${l}"; done
 
 DF=$(df -BG /u01 | tail -1 | awk '{print $4}')
 log "  /u01 available after cleanup: ${DF}"
