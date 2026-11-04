@@ -17,7 +17,7 @@
 #   On lnx107 (primary, post-switchback):  bash deploy/post_install_local.sh
 #   On lnx113 (standby):                  bash deploy/post_install_local.sh
 #
-# Background-safe: systemd-run --unit=dgpatch-post-install-local --remain-after-exit bash deploy/post_install_local.sh
+# Background-safe: systemd-run --unit=dgpatch-post-install-local -p KillMode=process --remain-after-exit bash deploy/post_install_local.sh
 # =============================================================================
 set -euo pipefail
 umask 0022
@@ -40,7 +40,7 @@ print_dry_run_plan() {
   drcmd  "su - ${ORACLE_USER} -c \"${NEW_DB_HOME}/bin/chopt disable rat\""
   drcmd  "su - ${ORACLE_USER} -c \"${NEW_DB_HOME}/bin/chopt disable partitioning\""
   drnote "chopt modifies the oracle binary. Restart required (Step C) to take effect."
-  drnote "For Non-CDB environments only. Do NOT disable partitioning on CDB environments."
+  drnote "chopt disable partitioning is skipped automatically on a CDB (non-CDB only)."
   drnote "Standby: chopt skipped -- binary changes do NOT propagate via redo; run independently."
   echo ""
   drstep "Step C: Restart database to apply chopt changes"
@@ -51,6 +51,7 @@ print_dry_run_plan() {
   drstep "Step D: Internal validations and utlrp (primary only)"
   drcmd  "sqlplus / as sysdba: EXEC SYS.XOQ_VALIDATE"
   drcmd  "sqlplus / as sysdba: EXEC SYS.APS_VALIDATE"
+  drnote "CDB: also run in PDB\$SEED and every PDB (catcon.pl), then check pdb_plug_in_violations is empty"
   drcmd  "sqlplus / as sysdba: @?/rdbms/admin/utlrp"
   echo ""
   drstep "Step E: Verify options, registry, and datapatch"
@@ -85,10 +86,16 @@ else
   IS_PRIMARY=false
 fi
 
+# Is this a CDB? (partitioning must not be disabled in a CDB; OLAP validation must cover every container)
+IS_CDB=$(runsql "${NEW_DB_HOME}" "${MY_SID}" "SET HEADING OFF PAGESIZE 0
+SELECT cdb FROM v\$database;" 2>/dev/null | tr -d '[:space:]' | grep -oE '^(YES|NO)' || true)
+IS_CDB="${IS_CDB:-unknown}"
+
 section "POST-INSTALL VALIDATION: ${THIS_HOST} ($(${IS_PRIMARY} && echo PRIMARY || echo STANDBY))"
 log "DB home : ${NEW_DB_HOME}"
 log "Grid home: ${NEW_GRID_HOME}"
 log "SID     : ${MY_SID}"
+log "CDB     : ${IS_CDB}"
 
 # ── Step A: Invalid object baseline ──────────────────────────────────────────
 step "Step A: Record invalid object baseline"
@@ -110,7 +117,13 @@ fi
 # ── Step B: chopt — disable unused options (PRIMARY ONLY) ────────────────────
 step "Step B: Disable unused DB options via chopt (primary only)"
 if ${IS_PRIMARY}; then
-  log "  Disabling: olap, rat (Real Application Testing), partitioning"
+  if [[ "${IS_CDB}" == "YES" ]]; then
+    CHOPT_PART="echo 'CDB: skipping chopt disable partitioning (non-CDB only)'"
+    log "  Disabling: olap, rat (partitioning skipped: this is a CDB)"
+  else
+    CHOPT_PART="echo 'Disabling Partitioning...'; ./chopt disable partitioning"
+    log "  Disabling: olap, rat (Real Application Testing), partitioning"
+  fi
   log "  NOTE: chopt modifies the binary — database restart required after this step"
   runora "
     export ORACLE_HOME=${NEW_DB_HOME}
@@ -120,8 +133,7 @@ if ${IS_PRIMARY}; then
     ./chopt disable olap
     echo 'Disabling Real Application Testing...'
     ./chopt disable rat
-    echo 'Disabling Partitioning...'
-    ./chopt disable partitioning
+    ${CHOPT_PART}
   " && pass "chopt disable complete" \
     || { fail "chopt returned non-zero — verify manually"; }
 else
@@ -171,6 +183,31 @@ EXEC SYS.XOQ_VALIDATE;
 SET SERVEROUTPUT ON
 EXEC SYS.APS_VALIDATE;
 " 2>/dev/null | while read -r l; do log "  ${l}"; done || warn "APS_VALIDATE returned non-zero"
+
+  if [[ "${IS_CDB}" == "YES" ]]; then
+    # XOQ_VALIDATE/APS_VALIDATE in CDB$ROOT alone leave the PDBs and PDB$SEED showing VALID while
+    # the root shows OPTION OFF. AutoUpgrade then fails with "Database option APS/XOQ mismatch"
+    # plug-in violations. Run them in every container (catcon.pl handles PDB$SEED).
+    log "  CDB: running XOQ_VALIDATE / APS_VALIDATE in CDB\$ROOT, PDB\$SEED and all open PDBs (catcon.pl)..."
+    printf 'exec sys.xoq_validate\nexec sys.aps_validate\n' > /tmp/olap_validate_all.sql
+    chmod 644 /tmp/olap_validate_all.sql
+    OLAP_LOGDIR=$(mktemp -d /tmp/olap_validate_logs_XXXXXX); chmod 777 "${OLAP_LOGDIR}"
+    runora "
+      export ORACLE_HOME=${NEW_DB_HOME}
+      export ORACLE_SID=${MY_SID}
+      export PATH=\${ORACLE_HOME}/bin:\${PATH}
+      \${ORACLE_HOME}/perl/bin/perl \${ORACLE_HOME}/rdbms/admin/catcon.pl -d /tmp -l ${OLAP_LOGDIR} -b olap_validate_all olap_validate_all.sql
+    " >/dev/null 2>&1 \
+      && pass "OLAP validation ran in all containers (logs: ${OLAP_LOGDIR})" \
+      || warn "catcon.pl returned non-zero. Review ${OLAP_LOGDIR}; run XOQ_VALIDATE / APS_VALIDATE in each container by hand."
+    PEND=$(runsql "${NEW_DB_HOME}" "${MY_SID}" "SET HEADING OFF PAGESIZE 0
+SELECT COUNT(*) FROM pdb_plug_in_violations WHERE status <> 'RESOLVED' AND message LIKE 'Database option%';" 2>/dev/null | tr -d '[:space:]' | grep -oE '^[0-9]+' || echo "?")
+    if [[ "${PEND}" == "0" ]]; then
+      pass "No pending 'Database option' plug-in violations"
+    else
+      warn "Pending 'Database option' plug-in violations: ${PEND}. Close and reopen the PDBs (alter pluggable database all close immediate; alter pluggable database all open;) and re-check, otherwise the next AutoUpgrade run will fail."
+    fi
+  fi
 
   log "  Running utlrp (recompile invalid objects)..."
   runsql "${NEW_DB_HOME}" "${MY_SID}" "

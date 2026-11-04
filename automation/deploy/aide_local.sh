@@ -9,7 +9,7 @@
 #   baseline.
 #
 # BACKGROUND-SAFE: This takes 30-60 minutes. Run with systemd-run.
-#   systemd-run --unit=dgpatch-aide-local --remain-after-exit bash deploy/aide_local.sh
+#   systemd-run --unit=dgpatch-aide-local -p KillMode=process --remain-after-exit bash deploy/aide_local.sh
 #   tail -f /u01/app/oracle/patch_logs/<node>/aide_local.log
 #
 # Two scenarios:
@@ -127,4 +127,4 @@ print_summary "aide_local"
 log ""
 log "AIDE reset complete on ${THIS_HOST}."
 log "Run on the other node if not already done:"
-log "  systemd-run --unit=dgpatch-aide-local --remain-after-exit bash deploy/aide_local.sh"
+log "  systemd-run --unit=dgpatch-aide-local -p KillMode=process --remain-after-exit bash deploy/aide_local.sh"

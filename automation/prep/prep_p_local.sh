@@ -4,7 +4,7 @@
 # Run as: root  ON: lnx107
 # Outage: NONE — primary stays live throughout
 #
-# BACKGROUND-SAFE: systemd-run --unit=dgpatch-prep-p-local --remain-after-exit bash prep/prep_p_local.sh
+# BACKGROUND-SAFE: systemd-run --unit=dgpatch-prep-p-local -p KillMode=process --remain-after-exit bash prep/prep_p_local.sh
 # tail -f /u01/app/oracle/patch_logs/lnx107/prep_p_local.log
 #
 # Identical logic to prep_s_local.sh but runs on lnx107 using PRIMARY

@@ -239,26 +239,47 @@ logout and idle timeouts cannot kill it. Tested on a hardened host: a service ru
 Define this once per login on each node (root):
 ```bash
 cd /u01/patching/automation          # directory that holds patch.conf, lib_common.sh, prep/, deploy/ ...
+dgprocs() {   # usage: dgprocs <unit name without .service>   number of processes still running inside the unit
+  local u="$1.service" f n=0
+  for f in "/sys/fs/cgroup/systemd/system.slice/${u}/cgroup.procs" "/sys/fs/cgroup/system.slice/${u}/cgroup.procs"; do
+    [[ -r "$f" ]] && { n=$(wc -l < "$f"); break; }
+  done
+  echo "${n}"
+}
 dgrun() {
   # usage: dgrun [-t] <script path relative to this dir> [script args, e.g. --dry-run or --from-step 6]
   local tty=0; [[ "$1" == "-t" ]] && { tty=1; shift; }
   local script="$1"; shift
   local unit="dgpatch-$(basename "${script}" .sh | tr _ -)"
-  systemctl stop "${unit}" 2>/dev/null || true               # clear a finished unit of the same name
-  systemctl reset-failed "${unit}" 2>/dev/null || true
+  if systemctl is-active --quiet "${unit}" && (( $(dgprocs "${unit}") > 0 )); then
+    # Steps that start Oracle (deploy, switchover) leave the instance inside the unit. Never stop such a unit.
+    unit="${unit}-$(date +%H%M%S)"
+    echo "Previous unit still owns running processes; using new unit name ${unit}"
+  else
+    systemctl stop "${unit}" 2>/dev/null || true             # clear a finished unit of the same name
+    systemctl reset-failed "${unit}" 2>/dev/null || true
+  fi
   if (( tty )); then                                          # interactive (password prompt)
     if systemd-run --help 2>&1 | grep -q -- '--pty'; then    # systemd 235 or newer
-      systemd-run --pty --unit="${unit}" --remain-after-exit bash "$(pwd)/${script}" "$@"
+      systemd-run --pty --unit="${unit}" -p KillMode=process --remain-after-exit bash "$(pwd)/${script}" "$@"
     else                                                      # older systemd (e.g. OL7): foreground scope
       systemd-run --scope --unit="${unit}" bash "$(pwd)/${script}" "$@"
     fi
   else                                                        # background service
-    systemd-run --unit="${unit}" --remain-after-exit bash "$(pwd)/${script}" "$@"
+    systemd-run --unit="${unit}" -p KillMode=process --remain-after-exit bash "$(pwd)/${script}" "$@"
   fi
 }
 dgstat() {    # usage: dgstat <script name without path, e.g. prep_s_local>
   local unit="dgpatch-$(echo "$1" | tr _ -)"
   systemctl show "${unit}" -p ActiveState -p Result -p ExecMainStatus
+  echo "ProcessesInUnit=$(dgprocs "${unit}")"
+}
+dgclean() {   # stop finished dgpatch units, but keep any unit that still owns running processes
+  local u n
+  for u in $(systemctl list-units 'dgpatch-*' --all --plain --no-legend | awk '{print $1}'); do
+    n=$(dgprocs "${u%.service}")
+    if (( n == 0 )); then systemctl stop "${u}" && echo "stopped ${u}"; else echo "kept ${u} (${n} processes still running in it)"; fi
+  done
 }
 ```
 - Plain `dgrun` runs in the background and returns at once. Use it for every step that does not ask a question.
@@ -272,13 +293,22 @@ dgstat() {    # usage: dgstat <script name without path, e.g. prep_s_local>
 - Do not pass the SYS password with `--setenv` or `-p Environment=`. Anyone can read unit environments with
   `systemctl show`, and the scripts promise never to expose the password.
 
+### Do not `systemctl stop` a unit that still owns processes
+Steps that start or restart Oracle (`deploy_*`, `switchover_*`, `switchback_*`) leave the instance and its
+background processes in the unit's cgroup, even after the script has exited. `systemctl status` then shows
+`Tasks:` and `Memory:` for an `active (exited)` unit. Stopping that unit kills the database.
+`dgrun` therefore starts units with `-p KillMode=process` (a stop signals only the already finished main
+process) and, when the previous unit still owns processes, starts the new run under a time-stamped unit name
+instead of stopping it. Use `dgclean` to clear finished units, `dgprocs <unit>` to see how many processes a
+unit owns, and never `systemctl stop 'dgpatch-*'` on a host where a deploy or switch step has run.
+
 ### Watching a step (safe to repeat after a reconnect)
 ```bash
 tail -n 50 /u01/patching/logs/logs1933/$(hostname -s)/<script name>.log    # LOG_BASE in patch.conf
 systemctl status dgpatch-<unit> --no-pager                                 # running, or exited
 dgstat <script name>                                                       # Result=success ExecMainStatus=0 when done
 journalctl -u dgpatch-<unit> --no-pager | tail -n 50                       # anything printed to the console
-systemctl stop dgpatch-<unit>                                              # clear the unit afterwards
+dgclean                                                                    # clear finished units (keeps any that still own processes)
 ```
 `Result=exit-code` with a non-zero `ExecMainStatus` means the step failed: read the script log first.
 Do not sit in a foreground `tail -f` for more than 10 minutes, because `TMOUT` will log you out
@@ -444,6 +474,11 @@ fix this automatically in Step 3d.
 
 0. **SYS.DB_DDL_ALERT_TRG.** `deploy_s_peer.sh` (on the primary, before the switchover, only when all its checks pass) disables the trigger in the non-CDB, or in the CDB root and every READ WRITE PDB. The DDL replicates to the standby through redo. `post_install_local.sh` Step G enables it again on the primary after patching (it refuses if the node is not PRIMARY). Containers without the trigger are skipped, PDBs that are not READ WRITE are reported. The helper is `ddl_trigger` in `lib_common.sh`.
 0b. **`cleanup_local.sh`:** `deinstall` is gone. Each old home is detached with `runInstaller -silent -detachHome ORACLE_HOME=<old home>` (from the new home, as the owner of the old home), and only if both detaches succeed are the old directories removed. The previous version looked up home names with a broken quote, so inventory entries were never detached. The script asks for YES, so start it with `dgrun -t`.
+
+0b2. **`ddl_trigger` (in `lib_common.sh`) uses `catcon.pl` on a CDB** instead of a PL/SQL loop with `ALTER SESSION SET CONTAINER`, which failed on the lab CDB. It runs the statement in CDB$ROOT and every open PDB (PDB$SEED excluded), lists PDBs that are not READ WRITE, and fails if the catcon logs contain ORA- or SP2- errors. A non-CDB still uses plain sqlplus. The same change is in the single-instance Phase 3 and Phase 4.
+0c. **OLAP mismatch (`Database option APS/XOQ mismatch`) in AutoUpgrade analyze.** After `chopt disable olap`, `post_install_local.sh` ran `XOQ_VALIDATE` and `APS_VALIDATE` only in CDB$ROOT, so the root showed `OPTION OFF` while PDB$SEED and the PDBs still showed `VALID`, and the next cycle's analyze failed with pending plug-in violations. Step D now runs both procedures in every container with `catcon.pl` (CDB only) and warns if `pdb_plug_in_violations` still lists `Database option` rows (close and reopen the PDBs to refresh them). Manual fix, per container: `exec sys.xoq_validate` and `exec sys.aps_validate`. PDB$SEED needs `catcon.pl -c 'PDB$SEED'`.
+0d. **`chopt disable partitioning` is skipped on a CDB** (it is for non-CDB only). Detected from `v$database.cdb`.
+0e. **`dgrun` no longer stops a unit that still owns processes.** Deploy and switch steps leave the Oracle instance inside the unit's cgroup, and `systemctl stop` on that unit kills the database. Units now start with `-p KillMode=process`; `dgrun` uses a new unit name if the old one still owns processes; `dgclean` and `dgprocs` are new. To abort a step that is still running: `systemctl kill --kill-who=all dgpatch-<unit>`.
 
 1. `prep_s_local.sh`, `prep_p_local.sh`: `gridSetup.sh` and `runInstaller` exit code 6 (success with optional prerequisite warnings) is accepted via the new `check_installer_rc` helper in `lib_common.sh`. Previously `&& pass || fail` treated 6 as a failure and stopped the prep.
 2. `lib_common.sh`: `run_gi_switch` logs the `gridSetup.sh -switchGridHome` exit code (0 and 6 are success).
