@@ -71,6 +71,7 @@ print_dry_run_plan() {
   drstep "Step 7: Verify patch levels"
   drcmd  "su - ${ORACLE_USER} -c \"${NEW_DB_HOME}/OPatch/opatch lspatches | grep ${DB_APPLY_RU_PATCH}\""
   drcmd  "su - ${GRID_USER}   -c \"${NEW_GRID_HOME}/OPatch/opatch lspatches | grep ${GI_APPLY_RU_PATCH}\""
+  drnote "Then update ~/.bash_profile and ~/.bashrc of root, ${GRID_USER} and ${ORACLE_USER}: ${OLD_GRID_HOME} -> ${NEW_GRID_HOME}, ${OLD_DB_HOME} -> ${NEW_DB_HOME} (backup *.pre_${NEW_PATCH_LEVEL})"
   echo ""
   drstep "Step 8: Start MRP"
   drcmd  "sqlplus / as sysdba: ALTER DATABASE RECOVER MANAGED STANDBY DATABASE USING CURRENT LOGFILE DISCONNECT FROM SESSION  (ORACLE_SID=${STANDBY_SID}, ORACLE_HOME=${NEW_DB_HOME})"
@@ -201,6 +202,8 @@ if should_run 7; then
   log "  Note: DBA_REGISTRY_SQLPATCH skipped on standby (read-only)."
   log "        datapatch runs on the primary after switchover."
   pass "Patch level verification complete (standby)"
+  log "  Updating shell profiles (root, ${GRID_USER}, ${ORACLE_USER}) to the new homes..."
+  update_user_profiles
 fi
 
 # ---------------------------------------------------------------------------

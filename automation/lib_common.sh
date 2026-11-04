@@ -97,6 +97,39 @@ rundgmgrl_auth() {
 }
 
 # ---------------------------------------------------------------------------
+# update_user_profiles
+# Point ORACLE_HOME / PATH entries in the shell profiles of root, the Grid owner and
+# the database owner (~/.bash_profile and ~/.bashrc) at the new homes. Run on each node
+# after its home switch. A backup <file>.pre_<NEW_PATCH_LEVEL> is kept (once per file),
+# owner and mode are preserved, and the update is safe to repeat.
+# ---------------------------------------------------------------------------
+update_user_profiles() {
+  local og="${OLD_GRID_HOME%/}" ng="${NEW_GRID_HOME%/}" od="${OLD_DB_HOME%/}" nd="${NEW_DB_HOME%/}"
+  local u dir f seen=" " e_og e_od r_ng r_nd
+  e_og=$(printf '%s' "${og}" | sed 's/[][\.*^$|]/\\&/g'); e_od=$(printf '%s' "${od}" | sed 's/[][\.*^$|]/\\&/g')
+  r_ng=$(printf '%s' "${ng}" | sed 's/[\&|]/\\&/g');       r_nd=$(printf '%s' "${nd}" | sed 's/[\&|]/\\&/g')
+  for u in root "${GRID_USER}" "${ORACLE_USER}"; do
+    [[ "${seen}" == *" ${u} "* ]] && continue
+    seen+="${u} "
+    dir=$(getent passwd "${u}" | cut -d: -f6)
+    if [[ -z "${dir}" || ! -d "${dir}" ]]; then warn "No home directory found for ${u} -- profiles not updated"; continue; fi
+    for f in "${dir}/.bash_profile" "${dir}/.bashrc"; do
+      [[ -f "${f}" ]] || { log "  ${f}: not present, skipped"; continue; }
+      if ! grep -qF -e "${og}" -e "${od}" "${f}"; then
+        log "  ${f}: no reference to ${og} or ${od}, unchanged"
+        continue
+      fi
+      [[ -e "${f}.pre_${NEW_PATCH_LEVEL}" ]] || cp -p "${f}" "${f}.pre_${NEW_PATCH_LEVEL}"
+      sed -i -e "s|${e_og}|${r_ng}|g" -e "s|${e_od}|${r_nd}|g" "${f}"
+      log "  ${f}: updated (backup ${f}.pre_${NEW_PATCH_LEVEL})"
+      grep -nE 'ORACLE_HOME|PATH' "${f}" | grep -v '^[0-9]*:[[:space:]]*#' | while IFS= read -r l; do log "      ${l}"; done || true
+      if grep -qF -e "${og}" -e "${od}" "${f}"; then warn "${f} still references an old home -- review by hand"; fi
+    done
+  done
+  pass "User profiles checked for root, ${GRID_USER}, ${ORACLE_USER}"
+}
+
+# ---------------------------------------------------------------------------
 # ddl_trigger DISABLE|ENABLE <oracle_home> <oracle_sid>
 # SYS.DB_DDL_ALERT_TRG: disabled on the primary before the switchover and
 # datapatch, enabled again by post_install_local.sh after patching.
