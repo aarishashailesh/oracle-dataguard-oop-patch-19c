@@ -239,11 +239,13 @@ logout and idle timeouts cannot kill it. Tested on a hardened host: a service ru
 Define this once per login on each node (root):
 ```bash
 cd /u01/patching/automation          # directory that holds patch.conf, lib_common.sh, prep/, deploy/ ...
-dgprocs() {   # usage: dgprocs <unit name without .service>   number of processes still running inside the unit
-  local u="$1.service" f n=0
-  for f in "/sys/fs/cgroup/systemd/system.slice/${u}/cgroup.procs" "/sys/fs/cgroup/system.slice/${u}/cgroup.procs"; do
-    [[ -r "$f" ]] && { n=$(wc -l < "$f"); break; }
+dgprocs() {   # usage: dgprocs <unit name without .service>   processes still running in the unit (sub-cgroups included)
+  local u="$1.service" d n=0 t
+  for d in "/sys/fs/cgroup/systemd/system.slice/${u}" "/sys/fs/cgroup/system.slice/${u}"; do
+    if [[ -d "$d" ]]; then n=$(find "$d" -name cgroup.procs -exec cat {} + 2>/dev/null | wc -l); break; fi
   done
+  t=$(systemctl show -p TasksCurrent "${u}" 2>/dev/null | cut -d= -f2)      # also trust systemd's own task count
+  if [[ "$t" =~ ^[0-9]+$ ]] && (( ${#t} < 10 )) && (( t > n )); then n=$t; fi
   echo "${n}"
 }
 dgrun() {
@@ -282,6 +284,13 @@ dgclean() {   # stop finished dgpatch units, but keep any unit that still owns r
   done
 }
 ```
+
+Keep the functions across logins (run once on each node, in the shell where you just defined them):
+```bash
+declare -f dgprocs dgrun dgstat dgclean > /etc/profile.d/dgpatch.sh
+bash -n /etc/profile.d/dgpatch.sh && grep -c "find" /etc/profile.d/dgpatch.sh    # 1 means the fixed dgprocs
+```
+Do not generate this file from an older copy of this README: older versions contain a `dgprocs` that does not count processes in sub-cgroups and reports 0 for a unit that still owns the instance.
 - Plain `dgrun` runs in the background and returns at once. Use it for every step that does not ask a question.
 - `dgrun -t` uses `systemd-run --pty` (or `systemd-run --scope` on systemd older than 235): the script still
   runs outside your session scope, but it is attached to your terminal so you can type the SYS password. Use it only for `switchtest_local.sh`, `switchover_local.sh`,
